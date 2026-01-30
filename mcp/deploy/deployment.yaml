@@ -19,10 +19,31 @@ spec:
       serviceAccountName: ocm-cluster-mcp
       containers:
       - name: mcp-server
-        image: quay.io/YOUR_QUAY_USERNAME/ocm-cluster-mcp:latest
+        image: quay.io/clyang82/ocm-mcp-server:latest
         imagePullPolicy: Always
         args:
         - "-v=2"
+        env:
+        - name: HTTP_MODE
+          value: "true"
+        - name: PORT
+          value: "8080"
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
         resources:
           limits:
             cpu: 100m
@@ -30,8 +51,6 @@ spec:
           requests:
             cpu: 50m
             memory: 64Mi
-        stdin: true
-        tty: true
 ---
 apiVersion: v1
 kind: Service
@@ -43,9 +62,28 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-  - name: stdio
+  - name: http
     port: 8080
     targetPort: 8080
     protocol: TCP
   selector:
     app: ocm-cluster-mcp
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ocm-cluster-mcp
+  namespace: open-cluster-management
+  labels:
+    app: ocm-cluster-mcp
+spec:
+  to:
+    kind: Service
+    name: ocm-cluster-mcp
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

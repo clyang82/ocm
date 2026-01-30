@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -357,6 +359,20 @@ func convertToClusterInfo(cluster *clusterv1.ManagedCluster) ClusterInfo {
 func (s *MCPServer) Run(ctx context.Context) error {
 	klog.InfoS("Starting MCP server", "name", serverName, "version", serverVersion)
 
+	// Check if we should run as HTTP server (for OpenShift route)
+	httpMode := os.Getenv("HTTP_MODE")
+	if httpMode == "true" {
+		return s.RunHTTP(ctx)
+	}
+
+	// Default stdio mode
+	return s.RunStdio(ctx)
+}
+
+// RunStdio runs the MCP server in stdio mode
+func (s *MCPServer) RunStdio(ctx context.Context) error {
+	klog.InfoS("Running in stdio mode")
+
 	// Read JSON-RPC requests from stdin and write responses to stdout
 	decoder := json.NewDecoder(os.Stdin)
 	encoder := json.NewEncoder(os.Stdout)
@@ -381,6 +397,70 @@ func (s *MCPServer) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// RunHTTP runs the MCP server in HTTP mode for remote access
+func (s *MCPServer) RunHTTP(ctx context.Context) error {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	klog.InfoS("Running in HTTP mode", "port", port)
+
+	http.HandleFunc("/mcp", s.handleHTTPRequest)
+	http.HandleFunc("/health", s.handleHealth)
+
+	server := &http.Server{
+		Addr: ":" + port,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(shutdownCtx)
+	}()
+
+	return server.ListenAndServe()
+}
+
+// handleHTTPRequest handles HTTP POST requests with MCP JSON-RPC
+func (s *MCPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req MCPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		klog.ErrorS(err, "Failed to decode request")
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	klog.V(2).InfoS("Received HTTP request", "method", req.Method)
+	resp := s.HandleRequest(r.Context(), req)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		klog.ErrorS(err, "Failed to encode response")
+	}
+}
+
+// handleHealth handles health check requests
+func (s *MCPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "healthy",
+		"name":   serverName,
+		"version": serverVersion,
+	})
 }
 
 func main() {
