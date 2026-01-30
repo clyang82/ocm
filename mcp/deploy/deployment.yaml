@@ -1,0 +1,51 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocm-cluster-mcp
+  namespace: open-cluster-management
+  labels:
+    app: ocm-cluster-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ocm-cluster-mcp
+  template:
+    metadata:
+      labels:
+        app: ocm-cluster-mcp
+    spec:
+      serviceAccountName: ocm-cluster-mcp
+      containers:
+      - name: mcp-server
+        image: quay.io/YOUR_QUAY_USERNAME/ocm-cluster-mcp:latest
+        imagePullPolicy: Always
+        args:
+        - "-v=2"
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        stdin: true
+        tty: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocm-cluster-mcp
+  namespace: open-cluster-management
+  labels:
+    app: ocm-cluster-mcp
+spec:
+  type: ClusterIP
+  ports:
+  - name: stdio
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  selector:
+    app: ocm-cluster-mcp
