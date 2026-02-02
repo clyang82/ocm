@@ -131,20 +131,33 @@ func (h *Handler) DryRunPlacement(ctx context.Context, params DryRunPlacementPar
 		return nil, fmt.Errorf("failed to list clusters: %v", err)
 	}
 
-	// Evaluate clusters against placement predicates
+	// Filter and evaluate clusters
 	decisions := []ClusterDecision{}
 
-	// If no predicates, select all clusters
-	if len(placement.Spec.Predicates) == 0 {
-		for _, cluster := range clusters.Items {
+	for _, cluster := range clusters.Items {
+		// Skip clusters in terminating state
+		if !cluster.DeletionTimestamp.IsZero() {
+			continue
+		}
+
+		// Check if cluster is tolerated (check taints)
+		tolerated, taintReason := isClusterTolerated(&cluster, placement.Spec.Tolerations)
+		if !tolerated {
+			continue
+		}
+
+		// If no predicates, select all tolerated clusters
+		if len(placement.Spec.Predicates) == 0 {
+			reason := "No predicates specified, all clusters match"
+			if taintReason != "" {
+				reason = taintReason
+			}
 			decisions = append(decisions, ClusterDecision{
 				ClusterName: cluster.Name,
-				Reason:      "No predicates specified, all clusters match",
+				Reason:      reason,
 			})
-		}
-	} else {
-		// Match clusters against predicates (predicates are ORed)
-		for _, cluster := range clusters.Items {
+		} else {
+			// Match clusters against predicates (predicates are ORed)
 			if matched, reason := matchClusterWithPredicates(&cluster, placement.Spec.Predicates); matched {
 				decisions = append(decisions, ClusterDecision{
 					ClusterName: cluster.Name,
@@ -169,6 +182,62 @@ func (h *Handler) DryRunPlacement(ctx context.Context, params DryRunPlacementPar
 		TotalMatched: len(decisions),
 		Summary:      summary,
 	}, nil
+}
+
+// isClusterTolerated checks if a cluster's taints are tolerated by the placement
+// Returns (tolerated, reason)
+func isClusterTolerated(cluster *clusterv1.ManagedCluster, tolerations []clusterv1beta1.Toleration) (bool, string) {
+	// If cluster has no taints, it's tolerated
+	if len(cluster.Spec.Taints) == 0 {
+		return true, ""
+	}
+
+	// Check each taint
+	for _, taint := range cluster.Spec.Taints {
+		// PreferNoSelect doesn't block selection
+		if taint.Effect == clusterv1.TaintEffectPreferNoSelect {
+			continue
+		}
+
+		// Check if this taint is tolerated
+		tolerated := false
+		for _, toleration := range tolerations {
+			if isTaintTolerated(taint, toleration) {
+				tolerated = true
+				break
+			}
+		}
+
+		// If not tolerated and effect is NoSelect, cluster cannot be selected
+		if !tolerated && taint.Effect == clusterv1.TaintEffectNoSelect {
+			return false, fmt.Sprintf("Cluster has untolerated taint: %s", taint.Key)
+		}
+	}
+
+	return true, ""
+}
+
+// isTaintTolerated checks if a specific taint is tolerated by a toleration
+func isTaintTolerated(taint clusterv1.Taint, toleration clusterv1beta1.Toleration) bool {
+	// Check effect matches if specified
+	if len(toleration.Effect) > 0 && toleration.Effect != taint.Effect {
+		return false
+	}
+
+	// Check key matches if specified
+	if len(toleration.Key) > 0 && toleration.Key != taint.Key {
+		return false
+	}
+
+	// Check operator and value
+	switch toleration.Operator {
+	case "", clusterv1beta1.TolerationOpEqual:
+		return toleration.Value == taint.Value
+	case clusterv1beta1.TolerationOpExists:
+		return true
+	default:
+		return false
+	}
 }
 
 // matchClusterWithPredicates checks if a cluster matches any of the predicates (ORed)
@@ -197,17 +266,13 @@ func matchClusterWithPredicate(cluster *clusterv1.ManagedCluster, predicate *clu
 		}
 	}
 
-	// Check claim selector
+	// Check claim selector with custom operator support
 	if len(selector.ClaimSelector.MatchExpressions) > 0 {
 		clusterClaims := getClusterClaims(cluster)
-		claimSelector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
-			MatchExpressions: selector.ClaimSelector.MatchExpressions,
-		})
-		if err != nil {
-			return false, fmt.Sprintf("Invalid claim selector: %v", err)
-		}
-		if !claimSelector.Matches(labels.Set(clusterClaims)) {
-			return false, "Claim selector did not match"
+		for _, requirement := range selector.ClaimSelector.MatchExpressions {
+			if !matchClaimRequirement(clusterClaims, requirement) {
+				return false, fmt.Sprintf("Claim requirement not met: %s %s", requirement.Key, requirement.Operator)
+			}
 		}
 	}
 
@@ -226,6 +291,62 @@ func getClusterClaims(cluster *clusterv1.ManagedCluster) map[string]string {
 		claims[claim.Name] = claim.Value
 	}
 	return claims
+}
+
+// matchClaimRequirement checks if a claim requirement is satisfied
+// Supports standard Kubernetes operators (In, NotIn, Exists, DoesNotExist)
+// and OCM custom operators (Gt, Lt) for version comparison
+func matchClaimRequirement(claims map[string]string, requirement metav1.LabelSelectorRequirement) bool {
+	claimValue, exists := claims[requirement.Key]
+
+	switch requirement.Operator {
+	case metav1.LabelSelectorOpIn:
+		if !exists {
+			return false
+		}
+		for _, value := range requirement.Values {
+			if claimValue == value {
+				return true
+			}
+		}
+		return false
+
+	case metav1.LabelSelectorOpNotIn:
+		if !exists {
+			return true
+		}
+		for _, value := range requirement.Values {
+			if claimValue == value {
+				return false
+			}
+		}
+		return true
+
+	case metav1.LabelSelectorOpExists:
+		return exists
+
+	case metav1.LabelSelectorOpDoesNotExist:
+		return !exists
+
+	case metav1.LabelSelectorOperator("Gt"):
+		// Greater than comparison for version strings
+		if !exists || len(requirement.Values) == 0 {
+			return false
+		}
+		// Simple string comparison works for version format like "4.16"
+		return claimValue > requirement.Values[0]
+
+	case metav1.LabelSelectorOperator("Lt"):
+		// Less than comparison
+		if !exists || len(requirement.Values) == 0 {
+			return false
+		}
+		return claimValue < requirement.Values[0]
+
+	default:
+		// Unknown operator
+		return false
+	}
 }
 
 // Requirements represents parsed placement requirements
