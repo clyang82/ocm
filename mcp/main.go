@@ -160,6 +160,14 @@ func (s *MCPServer) HandleRequest(ctx context.Context, req MCPRequest) MCPRespon
 		resp = s.handleToolsList(ctx, req.ID)
 	case "tools/call":
 		resp = s.handleToolsCall(ctx, req.ID, req.Params)
+	case "resources/list":
+		// We don't provide any resources
+		result, _ := json.Marshal(map[string]interface{}{"resources": []interface{}{}})
+		resp.Result = result
+	case "prompts/list":
+		// We don't provide any prompts
+		result, _ := json.Marshal(map[string]interface{}{"prompts": []interface{}{}})
+		resp.Result = result
 	case "notifications/initialized":
 		// This is a notification, not a request, so we don't send a response
 		return MCPResponse{}
@@ -615,6 +623,12 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 	// Process the request
 	resp := s.HandleRequest(r.Context(), req)
 
+	// Don't send a response for notifications
+	if req.Method == "notifications/initialized" {
+		klog.V(2).InfoS("Handled notification, no response needed", "sessionID", sessionID)
+		return
+	}
+
 	// Send response via SSE
 	respJSON, err := json.Marshal(resp)
 	if err != nil {
@@ -627,7 +641,7 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	klog.V(2).InfoS("Sent SSE response", "sessionID", sessionID)
+	klog.V(2).InfoS("Sent SSE response", "sessionID", sessionID, "method", req.Method)
 }
 
 // handleHealth handles health check requests
