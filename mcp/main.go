@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,19 +28,25 @@ const (
 
 // MCPServer represents the MCP server for OCM cluster operations
 type MCPServer struct {
-	clusterClient clusterclientset.Interface
+	clusterClient  clusterclientset.Interface
+	sseConnections map[string]http.ResponseWriter
+	sseConnMutex   sync.RWMutex
 }
 
 // MCPRequest represents an incoming MCP request
 type MCPRequest struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
 }
 
 // MCPResponse represents an MCP response
 type MCPResponse struct {
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *MCPError       `json:"error,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *MCPError       `json:"error,omitempty"`
 }
 
 // MCPError represents an MCP error
@@ -47,8 +55,25 @@ type MCPError struct {
 	Message string `json:"message"`
 }
 
-// ServerInfo represents server information
+// ServerInfo represents server information for initialize response
 type ServerInfo struct {
+	ProtocolVersion string           `json:"protocolVersion"`
+	Capabilities    Capabilities     `json:"capabilities"`
+	ServerInfo      ServerInfoDetail `json:"serverInfo"`
+}
+
+// Capabilities represents server capabilities
+type Capabilities struct {
+	Tools ToolsCapability `json:"tools"`
+}
+
+// ToolsCapability represents tools capability
+type ToolsCapability struct {
+	ListChanged bool `json:"listChanged"`
+}
+
+// ServerInfoDetail represents detailed server information
+type ServerInfoDetail struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 }
@@ -91,7 +116,8 @@ func NewMCPServer(kubeconfig string) (*MCPServer, error) {
 	}
 
 	return &MCPServer{
-		clusterClient: clusterClient,
+		clusterClient:  clusterClient,
+		sseConnections: make(map[string]http.ResponseWriter),
 	}, nil
 }
 
@@ -123,36 +149,55 @@ func getKubeConfig(kubeconfig string) (*rest.Config, error) {
 
 // HandleRequest processes an MCP request
 func (s *MCPServer) HandleRequest(ctx context.Context, req MCPRequest) MCPResponse {
+	var resp MCPResponse
+	resp.JSONRPC = "2.0"
+	resp.ID = req.ID
+
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(ctx)
+		resp = s.handleInitialize(ctx, req.ID)
 	case "tools/list":
-		return s.handleToolsList(ctx)
+		resp = s.handleToolsList(ctx, req.ID)
 	case "tools/call":
-		return s.handleToolsCall(ctx, req.Params)
+		resp = s.handleToolsCall(ctx, req.ID, req.Params)
+	case "notifications/initialized":
+		// This is a notification, not a request, so we don't send a response
+		return MCPResponse{}
 	default:
-		return MCPResponse{
-			Error: &MCPError{
-				Code:    -32601,
-				Message: fmt.Sprintf("Method not found: %s", req.Method),
-			},
+		resp.Error = &MCPError{
+			Code:    -32601,
+			Message: fmt.Sprintf("Method not found: %s", req.Method),
 		}
 	}
+
+	return resp
 }
 
 // handleInitialize handles the initialize request
-func (s *MCPServer) handleInitialize(ctx context.Context) MCPResponse {
+func (s *MCPServer) handleInitialize(ctx context.Context, id interface{}) MCPResponse {
 	info := ServerInfo{
-		Name:    serverName,
-		Version: serverVersion,
+		ProtocolVersion: "2025-06-18",
+		Capabilities: Capabilities{
+			Tools: ToolsCapability{
+				ListChanged: true,
+			},
+		},
+		ServerInfo: ServerInfoDetail{
+			Name:    serverName,
+			Version: serverVersion,
+		},
 	}
 
 	result, _ := json.Marshal(info)
-	return MCPResponse{Result: result}
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
 }
 
 // handleToolsList returns the list of available tools
-func (s *MCPServer) handleToolsList(ctx context.Context) MCPResponse {
+func (s *MCPServer) handleToolsList(ctx context.Context, id interface{}) MCPResponse {
 	tools := []ToolInfo{
 		{
 			Name:        "list_clusters",
@@ -191,11 +236,15 @@ func (s *MCPServer) handleToolsList(ctx context.Context) MCPResponse {
 	}
 
 	result, _ := json.Marshal(map[string]interface{}{"tools": tools})
-	return MCPResponse{Result: result}
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
 }
 
 // handleToolsCall handles tool execution requests
-func (s *MCPServer) handleToolsCall(ctx context.Context, params json.RawMessage) MCPResponse {
+func (s *MCPServer) handleToolsCall(ctx context.Context, id interface{}, params json.RawMessage) MCPResponse {
 	var toolCall struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -203,6 +252,8 @@ func (s *MCPServer) handleToolsCall(ctx context.Context, params json.RawMessage)
 
 	if err := json.Unmarshal(params, &toolCall); err != nil {
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32602,
 				Message: fmt.Sprintf("Invalid params: %v", err),
@@ -212,11 +263,13 @@ func (s *MCPServer) handleToolsCall(ctx context.Context, params json.RawMessage)
 
 	switch toolCall.Name {
 	case "list_clusters":
-		return s.listClusters(ctx, toolCall.Arguments)
+		return s.listClusters(ctx, id, toolCall.Arguments)
 	case "get_cluster":
-		return s.getCluster(ctx, toolCall.Arguments)
+		return s.getCluster(ctx, id, toolCall.Arguments)
 	default:
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32601,
 				Message: fmt.Sprintf("Tool not found: %s", toolCall.Name),
@@ -226,11 +279,13 @@ func (s *MCPServer) handleToolsCall(ctx context.Context, params json.RawMessage)
 }
 
 // listClusters lists managed clusters with optional label filtering
-func (s *MCPServer) listClusters(ctx context.Context, arguments json.RawMessage) MCPResponse {
+func (s *MCPServer) listClusters(ctx context.Context, id interface{}, arguments json.RawMessage) MCPResponse {
 	var params ListClustersParams
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &params); err != nil {
 			return MCPResponse{
+				JSONRPC: "2.0",
+				ID:      id,
 				Error: &MCPError{
 					Code:    -32602,
 					Message: fmt.Sprintf("Invalid arguments: %v", err),
@@ -251,6 +306,8 @@ func (s *MCPServer) listClusters(ctx context.Context, arguments json.RawMessage)
 	clusters, err := s.clusterClient.ClusterV1().ManagedClusters().List(ctx, listOpts)
 	if err != nil {
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32603,
 				Message: fmt.Sprintf("Failed to list clusters: %v", err),
@@ -267,16 +324,22 @@ func (s *MCPServer) listClusters(ctx context.Context, arguments json.RawMessage)
 		"clusters": clusterInfos,
 		"count":    len(clusterInfos),
 	})
-	return MCPResponse{Result: result}
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
 }
 
 // getCluster retrieves a specific cluster by name
-func (s *MCPServer) getCluster(ctx context.Context, arguments json.RawMessage) MCPResponse {
+func (s *MCPServer) getCluster(ctx context.Context, id interface{}, arguments json.RawMessage) MCPResponse {
 	var params struct {
 		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(arguments, &params); err != nil {
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32602,
 				Message: fmt.Sprintf("Invalid arguments: %v", err),
@@ -286,6 +349,8 @@ func (s *MCPServer) getCluster(ctx context.Context, arguments json.RawMessage) M
 
 	if params.Name == "" {
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32602,
 				Message: "Cluster name is required",
@@ -296,6 +361,8 @@ func (s *MCPServer) getCluster(ctx context.Context, arguments json.RawMessage) M
 	cluster, err := s.clusterClient.ClusterV1().ManagedClusters().Get(ctx, params.Name, metav1.GetOptions{})
 	if err != nil {
 		return MCPResponse{
+			JSONRPC: "2.0",
+			ID:      id,
 			Error: &MCPError{
 				Code:    -32603,
 				Message: fmt.Sprintf("Failed to get cluster: %v", err),
@@ -305,7 +372,11 @@ func (s *MCPServer) getCluster(ctx context.Context, arguments json.RawMessage) M
 
 	info := convertToClusterInfo(cluster)
 	result, _ := json.Marshal(info)
-	return MCPResponse{Result: result}
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
 }
 
 // convertToClusterInfo converts a ManagedCluster to ClusterInfo
@@ -408,7 +479,8 @@ func (s *MCPServer) RunHTTP(ctx context.Context) error {
 
 	klog.InfoS("Running in HTTP mode", "port", port)
 
-	http.HandleFunc("/mcp", s.handleHTTPRequest)
+	http.HandleFunc("/mcp", s.handleSSEConnection)
+	http.HandleFunc("/messages/", s.handleSSEMessage)
 	http.HandleFunc("/health", s.handleHealth)
 
 	server := &http.Server{
@@ -450,6 +522,112 @@ func (s *MCPServer) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		klog.ErrorS(err, "Failed to encode response")
 	}
+}
+
+// handleSSEConnection handles SSE connection establishment
+func (s *MCPServer) handleSSEConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Generate session ID
+	sessionID := strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	klog.V(2).InfoS("New SSE connection", "sessionID", sessionID)
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Store connection
+	s.sseConnMutex.Lock()
+	s.sseConnections[sessionID] = w
+	s.sseConnMutex.Unlock()
+
+	// Send endpoint message
+	fmt.Fprintf(w, "event: endpoint\ndata: /messages/?session_id=%s\n\n", sessionID)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Keep connection alive with heartbeat
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			s.sseConnMutex.Lock()
+			delete(s.sseConnections, sessionID)
+			s.sseConnMutex.Unlock()
+			klog.V(2).InfoS("SSE connection closed", "sessionID", sessionID)
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, ": ping - %s\n\n", time.Now().Format(time.RFC3339))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}
+}
+
+// handleSSEMessage handles messages sent to SSE connections
+func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		http.Error(w, "Invalid session ID", http.StatusBadRequest)
+		return
+	}
+
+	klog.V(2).InfoS("Received SSE message", "sessionID", sessionID)
+
+	// Get SSE connection
+	s.sseConnMutex.RLock()
+	sseWriter, ok := s.sseConnections[sessionID]
+	s.sseConnMutex.RUnlock()
+
+	if !ok {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// Decode MCP request
+	var req MCPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		klog.ErrorS(err, "Failed to decode request")
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Accept the message immediately (like the TypeScript server)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Accepted"))
+
+	// Process the request
+	resp := s.HandleRequest(r.Context(), req)
+
+	// Send response via SSE
+	respJSON, err := json.Marshal(resp)
+	if err != nil {
+		klog.ErrorS(err, "Failed to marshal response")
+		return
+	}
+
+	fmt.Fprintf(sseWriter, "event: message\ndata: %s\n\n", string(respJSON))
+	if f, ok := sseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	klog.V(2).InfoS("Sent SSE response", "sessionID", sessionID)
 }
 
 // handleHealth handles health check requests
